@@ -1,5 +1,6 @@
 import csv
 import time
+import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Iterable
 
@@ -48,12 +49,13 @@ class CKANClient:
                 backoff *= 2
         return None
 
-    def iter_datasets(self) -> Iterable[DatasetInfo]:
+    def iter_datasets(self, limit: Optional[int] = None) -> Iterable[DatasetInfo]:
         first = self._get_json("/package_search", {"rows": 1, "start": 0})
         if not first or not first.get("success"):
             return
         total = first["result"]["count"]
         start = 0
+        emitted = 0
         while start < total:
             payload = self._get_json("/package_search", {"rows": self.page_size, "start": start})
             if not payload  or not payload.get("success"):
@@ -62,7 +64,10 @@ class CKANClient:
             if not results:
                 break
             for pkg in results:
+                if limit is not None and emitted >= limit:
+                    return
                 yield self._to_dataset(pkg)
+                emitted += 1
             start += self.page_size
             if self.delay:
                 time.sleep(self.delay)
@@ -171,22 +176,31 @@ class CsvRowCounter:
 
 
 class DatasetAuditor:
-    def __init__(self, ckan: CKANClient, datastore: DataStoreClient, csv_counter: Optional[CsvRowCounter] = None):
+    def __init__(self, ckan: CKANClient, datastore: DataStoreClient, csv_counter: Optional['CsvRowCounter'] = None, verbose: bool = False):
         self.ckan = ckan
         self.datastore = datastore
         self.csv_counter = csv_counter
+        self.verbose = verbose
 
     def audit_dataset(self, ds: DatasetInfo) -> DatasetMetrics:
         rows_total = 0
         for res in ds.resources:
+            if self.verbose:
+                print(f"[res] datastore_active={bool(res.datastore_active)} id={res.id} url={res.url}")
             if res.datastore_active and res.id:
                 stats = self.datastore.get_rows_cols(res.id)
                 if stats and isinstance(stats.get("rows"), int):
                     rows_total += stats["rows"]
+                elif self.verbose:
+                    print(f"[datastore] no rows/failed for resource {res.id}")
             elif self.csv_counter and res.url:
                 c = self.csv_counter.count_rows(res.url)
                 if isinstance(c, int) and c > 0:
                     rows_total += c
+                elif self.verbose:
+                    print(f"[fallback] no count for url={res.url}")
+        if self.verbose:
+            print(f"[dataset-total] {ds.title} ({ds.id}) rows_total={rows_total}")
         return DatasetMetrics(
             dataset_id=ds.id,
             dataset_title=ds.title,
@@ -194,8 +208,8 @@ class DatasetAuditor:
             rows_total=rows_total
         )
 
-    def audit_all(self) -> Iterable[DatasetMetrics]:
-        for ds in self.ckan.iter_datasets():
+    def audit_all(self, limit: Optional[int] = None) -> Iterable[DatasetMetrics]:
+        for ds in self.ckan.iter_datasets(limit=limit):
             print(f"Auditing dataset: id={ds.id}, title={ds.title}")
             yield self.audit_dataset(ds)
 
@@ -204,6 +218,8 @@ class CSVReporter:
     def __init__(self, path: str):
         self.path = path
         self._ensure_header()
+        import os
+        print(f"[csv] writing to {os.path.abspath(self.path)}")
 
     def _ensure_header(self):
         import os
@@ -229,14 +245,22 @@ class CSVReporter:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-bytes", type=int, default=15000000)
+    parser.add_argument("--chunk-size", type=int, default=65536)
+    parser.add_argument("--out", type=str, default="data_gov_ua_datastore_audit_2.csv")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
     base = "https://data.gov.ua/api/3/action"
     ckan = CKANClient(base)
     ds = DataStoreClient(base)
     http = HttpUtil()
-    csv_counter = CsvRowCounter(http, max_bytes=15000000, chunk_size=65536)
-    auditor = DatasetAuditor(ckan, ds, csv_counter)
-    reporter = CSVReporter("data_gov_ua_datastore_audit.csv")
-    for metrics in auditor.audit_all():
+    csv_counter = CsvRowCounter(http, max_bytes=args.max_bytes, chunk_size=args.chunk_size)
+    auditor = DatasetAuditor(ckan, ds, csv_counter, verbose=args.verbose)
+    reporter = CSVReporter(args.out)
+    for metrics in auditor.audit_all(limit=args.limit):
         reporter.append(metrics)
 
 if __name__ == "__main__":
