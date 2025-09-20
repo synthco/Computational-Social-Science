@@ -1,23 +1,27 @@
-import csv
-import time
 import argparse
+import csv
+import os
+import tempfile
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Iterable
-
 import requests
 
 
 @dataclass
-class  ResourceInfo:
+class ResourceInfo:
     id: str
     url: Optional[str]
     datastore_active: bool
+    format: Optional[str] = None
+
 
 @dataclass
 class DatasetInfo:
     id: str
     title: str
     resources: List[ResourceInfo]
+
 
 @dataclass
 class DatasetMetrics:
@@ -41,7 +45,12 @@ class CKANClient:
         backoff = 0.5
         for _ in range(self.retries):
             try:
-                r = requests.get(url, params=params, timeout=self.timeout)
+                r = requests.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout,
+                    headers={"User-Agent": "ckan-audit/1.0"}
+                )
                 if r.status_code == 200:
                     return r.json()
             except Exception:
@@ -49,17 +58,29 @@ class CKANClient:
                 backoff *= 2
         return None
 
+    def _package_search(self, start: int, rows: int) -> Optional[Dict]:
+        return self._get_json("/package_search", {"q": "*:*", "rows": rows, "start": start})
+
     def iter_datasets(self, limit: Optional[int] = None) -> Iterable[DatasetInfo]:
-        first = self._get_json("/package_search", {"rows": 1, "start": 0})
+        first = self._package_search(start=0, rows=1)
         if not first or not first.get("success"):
+            print("[ckan] package_search initial request failed or no success; falling back to package_list")
+            yield from self.iter_datasets_via_list(limit=limit)
             return
-        total = first["result"]["count"]
+        total = int(first["result"].get("count") or 0)
+        print(f"[ckan] package_search count={total}")
+        if total == 0:
+            print("[ckan] package_search returned 0 results; falling back to package_list")
+            yield from self.iter_datasets_via_list(limit=limit)
+            return
         start = 0
         emitted = 0
         while start < total:
-            payload = self._get_json("/package_search", {"rows": self.page_size, "start": start})
-            if not payload  or not payload.get("success"):
-                break
+            payload = self._package_search(start=start, rows=self.page_size)
+            if not payload or not payload.get("success"):
+                print("[ckan] package_search page fetch failed; falling back to package_list for remaining")
+                yield from self.iter_datasets_via_list(limit=limit)
+                return
             results = payload["result"]["results"]
             if not results:
                 break
@@ -72,14 +93,36 @@ class CKANClient:
             if self.delay:
                 time.sleep(self.delay)
 
+    def iter_datasets_via_list(self, limit: Optional[int] = None) -> Iterable[DatasetInfo]:
+        listing = self._get_json("/package_list", {})
+        if not listing or not listing.get("success"):
+            print("[ckan] package_list failed")
+            return
+        ids = listing.get("result") or []
+        emitted = 0
+        for pkg_id in ids:
+            if limit is not None and emitted >= limit:
+                return
+            data = self._get_json("/package_show", {"id": pkg_id})
+            if data and data.get("success"):
+                yield self._to_dataset(data["result"])
+                emitted += 1
+            else:
+                print(f"[ckan] package_show failed for id={pkg_id}")
+            if self.delay:
+                time.sleep(self.delay)
+
     def _to_dataset(self, pkg: Dict[str, Any]) -> DatasetInfo:
         resources = []
         for res in pkg.get("resources") or []:
+            fmt = res.get("format")
+            fmt_norm = fmt.lower() if isinstance(fmt, str) and fmt.strip() else None
             resources.append(
                 ResourceInfo(
                     id=res.get("id"),
                     url=res.get("url"),
                     datastore_active=res.get("datastore_active"),
+                    format = fmt_norm
                 )
             )
         return DatasetInfo(
@@ -89,14 +132,12 @@ class CKANClient:
         )
 
 
-
 class DataStoreClient:
     def __init__(self, base_url: str, timeout: int = 30, retries: int = 3, delay: float = 0.1):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
         self.delay = delay
-
 
     def get_rows_cols(self, resource_id: str) -> Optional[Dict[str, int]]:
         url = f"{self.base_url}/datastore_search"
@@ -120,9 +161,11 @@ class DataStoreClient:
                 backoff *= 2
         return None
 
+
 class HttpUtil:
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
+
     def head_content_length(self, url: str) -> Optional[int]:
         try:
             r = requests.head(url, allow_redirects=True, timeout=self.timeout)
@@ -141,17 +184,39 @@ class HttpUtil:
             if chunk:
                 yield chunk
 
+    def download_to_tempfile(self, url: str, max_bytes: int, chunk_size: int = 65536) -> Optional[str]:
+        try:
+            r = requests.get(url, stream=True, timeout=self.timeout)
+            r.raise_for_status()
+            total = 0
+            suffix = ".xlsx" if url.lower().endswith(".xlsx") else ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        tmp.close()
+                        os.unlink(tmp.name)
+                        return None
+                    tmp.write(chunk)
+                return tmp.name
+        except Exception:
+            return None
+
 
 class CsvRowCounter:
     def __init__(self, http: HttpUtil, max_bytes: int = 15000000, chunk_size: int = 65536):
         self.http = http
         self.max_bytes = max_bytes
         self.chunk_size = chunk_size
+
     def is_csv_url(self, url: Optional[str]) -> bool:
         if not url:
             return False
         u = url.lower()
         return u.endswith(".csv")
+
     def count_rows(self, url: str) -> Optional[int]:
         if not self.is_csv_url(url):
             return None
@@ -175,12 +240,60 @@ class CsvRowCounter:
             return None
 
 
+class XlsxRowCounter:
+    def __init__(self, http: HttpUtil, max_bytes: int = 20000000, chunk_size: int = 65536):
+        self.http = http
+        self.max_bytes = max_bytes
+        self.chunk_size = chunk_size
+
+    def is_xlsx_url(self, url: Optional[str], fmt: Optional[str] = None) -> bool:
+        if fmt and isinstance(fmt, str) and fmt.lower() in {"xlsx", "excel"}:
+            return True
+        if not url:
+            return False
+        u = url.lower()
+        if "?" in u:
+            u = u.split("?", 1)[0]
+        return u.endswith(".xlsx")
+
+    def count_rows(self, url: str, fmt: Optional[str] = None) -> Optional[int]:
+        if not self.is_xlsx_url(url, fmt):
+            return None
+        path = self.http.download_to_tempfile(url, max_bytes=self.max_bytes, chunk_size=self.chunk_size)
+        if not path:
+            return None
+        try:
+            try:
+                import openpyxl
+            except ImportError:
+                return None
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                rows = 0
+                for row in ws.iter_rows(values_only=True):
+                    if any(cell is not None and str(cell).strip() != "" for cell in row):
+                        rows += 1
+                return rows
+            finally:
+                wb.close()
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 class DatasetAuditor:
-    def __init__(self, ckan: CKANClient, datastore: DataStoreClient, csv_counter: Optional['CsvRowCounter'] = None, verbose: bool = False):
+    def __init__(self, ckan: CKANClient, datastore: DataStoreClient, csv_counter: Optional['CsvRowCounter'] = None,
+                 xlsx_counter: Optional['XlsxRowCounter'] = None, verbose: bool = False):
         self.ckan = ckan
         self.datastore = datastore
         self.csv_counter = csv_counter
         self.verbose = verbose
+        self.xlsx_counter = xlsx_counter
 
     def audit_dataset(self, ds: DatasetInfo) -> DatasetMetrics:
         rows_total = 0
@@ -193,14 +306,28 @@ class DatasetAuditor:
                     rows_total += stats["rows"]
                 elif self.verbose:
                     print(f"[datastore] no rows/failed for resource {res.id}")
-            elif self.csv_counter and res.url:
-                c = self.csv_counter.count_rows(res.url)
-                if isinstance(c, int) and c > 0:
-                    rows_total += c
-                elif self.verbose:
+            elif res.url:
+                used = False
+                if self.csv_counter:
+                    c = self.csv_counter.count_rows(res.url)
+                    if isinstance(c, int) and c > 0:
+                        rows_total += c
+                        used = True
+                        if self.verbose:
+                            print(f"[fallback-csv] +{c} rows from {res.url}")
+                if not used and self.xlsx_counter:
+                    x = self.xlsx_counter.count_rows(res.url, getattr(res, "format", None))
+                    if isinstance(x, int) and x > 0:
+                        rows_total += x
+                        used = True
+                        if self.verbose:
+                            print(f"[fallback-xlsx] +{x} rows from {res.url}")
+                if not used and self.verbose:
                     print(f"[fallback] no count for url={res.url}")
         if self.verbose:
             print(f"[dataset-total] {ds.title} ({ds.id}) rows_total={rows_total}")
+            if rows_total == 0:
+                print(f"[dataset-zero] {ds.title} ({ds.id}) has 0 rows after all fallbacks")
         return DatasetMetrics(
             dataset_id=ds.id,
             dataset_title=ds.title,
@@ -236,12 +363,10 @@ class CSVReporter:
                 w = csv.writer(f)
                 w.writerow(["dataset_id", "dataset_title", "n_resources", "rows_total"])
 
-
     def append(self, m: DatasetMetrics):
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([m.dataset_id, m.dataset_title, m.n_resources, m.rows_total])
-
 
 
 def main():
@@ -258,10 +383,12 @@ def main():
     ds = DataStoreClient(base)
     http = HttpUtil()
     csv_counter = CsvRowCounter(http, max_bytes=args.max_bytes, chunk_size=args.chunk_size)
-    auditor = DatasetAuditor(ckan, ds, csv_counter, verbose=args.verbose)
+    xlsx_counter = XlsxRowCounter(http, max_bytes=max(args.max_bytes, 20000000), chunk_size=args.chunk_size)
+    auditor = DatasetAuditor(ckan, ds, csv_counter, xlsx_counter, verbose=args.verbose)
     reporter = CSVReporter(args.out)
     for metrics in auditor.audit_all(limit=args.limit):
         reporter.append(metrics)
+
 
 if __name__ == "__main__":
     main()
