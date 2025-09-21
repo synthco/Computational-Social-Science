@@ -31,6 +31,17 @@ class DatasetMetrics:
     rows_total: int
 
 
+@dataclass
+class LargeResource:
+    dataset_id: str
+    dataset_title: str
+    resource_id: Optional[str]
+    url: Optional[str]
+    format: Optional[str]
+    content_length: Optional[int]
+    reason: str
+
+
 class CKANClient:
     def __init__(self, base_url: str, page_size: int = 1000, delay: float = 0.1, timeout: int = 30,
                  retries: int = 3):
@@ -286,46 +297,148 @@ class XlsxRowCounter:
                 pass
 
 
+class ZipRowCounter:
+    def __init__(self, http: HttpUtil, max_bytes: int = 25000000, per_file_max_bytes: int = 15000000, chunk_size: int = 65536):
+        self.http = http
+        self.max_bytes = max_bytes
+        self.per_file_max_bytes = per_file_max_bytes
+        self.chunk_size = chunk_size
+
+    def is_zip_url(self, url: Optional[str], fmt: Optional[str] = None) -> bool:
+        if fmt and isinstance(fmt, str) and fmt.lower() == "zip":
+            return True
+        if not url:
+            return False
+        u = url.lower()
+        if "?" in u:
+            u = u.split("?", 1)[0]
+        return u.endswith(".zip")
+
+    def _count_csv_stream(self, zf, name: str) -> Optional[int]:
+        try:
+            # read as binary and count newlines in chunks without loading into memory
+            f = zf.open(name, "r")
+            try:
+                total = 0
+                lines = 0
+                tail_nl = True
+                while True:
+                    chunk = f.read(self.chunk_size)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self.per_file_max_bytes:
+                        return None
+                    lines += chunk.count(b"\n")
+                    tail_nl = chunk.endswith(b"\n")
+                if total == 0:
+                    return 0
+                if not tail_nl:
+                    lines += 1
+                return lines
+            finally:
+                f.close()
+        except Exception:
+            return None
+
+    def count_rows(self, url: str, fmt: Optional[str] = None) -> Optional[int]:
+        if not self.is_zip_url(url, fmt):
+            return None
+        path = self.http.download_to_tempfile(url, max_bytes=self.max_bytes, chunk_size=self.chunk_size)
+        if not path:
+            return None
+        try:
+            import zipfile
+            rows = 0
+            with zipfile.ZipFile(path, "r") as zf:
+                names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not names:
+                    return None
+                for name in names:
+                    c = self._count_csv_stream(zf, name)
+                    if isinstance(c, int) and c > 0:
+                        rows += c
+            return rows if rows > 0 else None
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 class DatasetAuditor:
-    def __init__(self, ckan: CKANClient, datastore: DataStoreClient, csv_counter: Optional['CsvRowCounter'] = None,
-                 xlsx_counter: Optional['XlsxRowCounter'] = None, verbose: bool = False):
+    def __init__(self, ckan: CKANClient, datastore: DataStoreClient, http: 'HttpUtil', csv_counter: Optional['CsvRowCounter'] = None,
+                 xlsx_counter: Optional['XlsxRowCounter'] = None, zip_counter: Optional['ZipRowCounter'] = None,
+                 large_reporter: Optional['LargeResourceReporter'] = None, large_threshold: int = 536870912, verbose: bool = False):
         self.ckan = ckan
         self.datastore = datastore
         self.csv_counter = csv_counter
         self.verbose = verbose
         self.xlsx_counter = xlsx_counter
+        self.zip_counter = zip_counter
+        self.http = http
+        self.large_reporter = large_reporter
+        self.large_threshold = int(large_threshold)
 
     def audit_dataset(self, ds: DatasetInfo) -> DatasetMetrics:
-        rows_total = 0
+        counts: list[int] = []
         for res in ds.resources:
             if self.verbose:
                 print(f"[res] datastore_active={bool(res.datastore_active)} id={res.id} url={res.url}")
             if res.datastore_active and res.id:
                 stats = self.datastore.get_rows_cols(res.id)
                 if stats and isinstance(stats.get("rows"), int):
-                    rows_total += stats["rows"]
+                    counts.append(int(stats["rows"]))
+                    if self.verbose:
+                        print(f"[datastore] rows={int(stats['rows'])} for resource {res.id}")
                 elif self.verbose:
                     print(f"[datastore] no rows/failed for resource {res.id}")
             elif res.url:
+                # Large resource upfront check
+                cl = self.http.head_content_length(res.url)
+                if cl is not None and cl >= self.large_threshold:
+                    if self.large_reporter:
+                        self.large_reporter.append(LargeResource(
+                            dataset_id=ds.id,
+                            dataset_title=ds.title,
+                            resource_id=res.id,
+                            url=res.url,
+                            format=getattr(res, "format", None),
+                            content_length=cl,
+                            reason="content-length>=threshold"
+                        ))
+                    if self.verbose:
+                        print(f"[large] skip resource {res.id} size={cl} bytes url={res.url}")
+                    continue
                 used = False
                 if self.csv_counter:
                     c = self.csv_counter.count_rows(res.url)
                     if isinstance(c, int) and c > 0:
-                        rows_total += c
+                        counts.append(int(c))
                         used = True
                         if self.verbose:
-                            print(f"[fallback-csv] +{c} rows from {res.url}")
+                            print(f"[fallback-csv] rows={int(c)} from {res.url}")
                 if not used and self.xlsx_counter:
                     x = self.xlsx_counter.count_rows(res.url, getattr(res, "format", None))
                     if isinstance(x, int) and x > 0:
-                        rows_total += x
+                        counts.append(int(x))
                         used = True
                         if self.verbose:
-                            print(f"[fallback-xlsx] +{x} rows from {res.url}")
+                            print(f"[fallback-xlsx] rows={int(x)} from {res.url}")
+                if not used and self.zip_counter:
+                    z = self.zip_counter.count_rows(res.url, getattr(res, "format", None))
+                    if isinstance(z, int) and z > 0:
+                        counts.append(int(z))
+                        used = True
+                        if self.verbose:
+                            print(f"[fallback-zip] rows={int(z)} from {res.url}")
                 if not used and self.verbose:
                     print(f"[fallback] no count for url={res.url}")
+        rows_total = max(counts) if counts else 0
         if self.verbose:
-            print(f"[dataset-total] {ds.title} ({ds.id}) rows_total={rows_total}")
+            print(f"[dataset-total] {ds.title} ({ds.id}) rows_total(max)={rows_total}")
             if rows_total == 0:
                 print(f"[dataset-zero] {ds.title} ({ds.id}) has 0 rows after all fallbacks")
         return DatasetMetrics(
@@ -339,6 +452,7 @@ class DatasetAuditor:
         for ds in self.ckan.iter_datasets(limit=limit):
             print(f"Auditing dataset: id={ds.id}, title={ds.title}")
             yield self.audit_dataset(ds)
+
 
 
 class CSVReporter:
@@ -369,6 +483,33 @@ class CSVReporter:
             w.writerow([m.dataset_id, m.dataset_title, m.n_resources, m.rows_total])
 
 
+# Reporter for large resources
+class LargeResourceReporter:
+    def __init__(self, path: str):
+        self.path = path
+        self._ensure_header()
+        print(f"[large] writing to {os.path.abspath(self.path)}")
+
+    def _ensure_header(self):
+        need_header = False
+        if not os.path.exists(self.path):
+            need_header = True
+            mode = "w"
+        else:
+            mode = "a"
+            if os.path.getsize(self.path) == 0:
+                need_header = True
+        if need_header:
+            with open(self.path, mode, newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["dataset_id", "dataset_title", "resource_id", "url", "format", "content_length_bytes", "reason"])
+
+    def append(self, r: LargeResource):
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([r.dataset_id, r.dataset_title, r.resource_id, r.url, r.format, r.content_length, r.reason])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
@@ -376,6 +517,8 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=65536)
     parser.add_argument("--out", type=str, default="data_gov_ua_datastore_audit_2.csv")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--large-threshold", type=int, default=536870912, help="Bytes; default 512 MiB")
+    parser.add_argument("--large-out", type=str, default="large_resources.csv")
     args = parser.parse_args()
 
     base = "https://data.gov.ua/api/3/action"
@@ -384,7 +527,9 @@ def main():
     http = HttpUtil()
     csv_counter = CsvRowCounter(http, max_bytes=args.max_bytes, chunk_size=args.chunk_size)
     xlsx_counter = XlsxRowCounter(http, max_bytes=max(args.max_bytes, 20000000), chunk_size=args.chunk_size)
-    auditor = DatasetAuditor(ckan, ds, csv_counter, xlsx_counter, verbose=args.verbose)
+    zip_counter = ZipRowCounter(http, max_bytes=max(args.max_bytes, 25000000), per_file_max_bytes=max(int(args.max_bytes*0.9), 10000000), chunk_size=args.chunk_size)
+    large_reporter = LargeResourceReporter(args.large_out)
+    auditor = DatasetAuditor(ckan, ds, http, csv_counter, xlsx_counter, zip_counter, large_reporter=large_reporter, large_threshold=args.large_threshold, verbose=args.verbose)
     reporter = CSVReporter(args.out)
     for metrics in auditor.audit_all(limit=args.limit):
         reporter.append(metrics)
